@@ -1,9 +1,11 @@
+import argparse
 import asyncio
-import struct
+import logging
 import os
+import struct
+
 from pg_buffer import PgBuffer
 from pg_data_types import IntField, field_factory
-import logging
 
 logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s")
 
@@ -34,13 +36,16 @@ AUTH_KERBEROS_V5 = 2
 AUTH_PLAIN_TEXT = 3
 AUTH_MD5 = 5
 
+
 # Class to handle PostgreSQL communication asynchronously
 class AsyncPsqlHandler:
-    __slots__ = ('reader', 'writer', 'pgbuf', 'prepared_statements')
-    def __init__(self, reader, writer):
+    __slots__ = ("reader", "writer", "pgbuf", "prepared_statements", "args")
+
+    def __init__(self, reader, writer, args):
         self.reader = reader
         self.writer = writer
         self.pgbuf = PgBuffer(reader, writer)
+        self.args = args
         self.prepared_statements = {}  # Store prepared statements
 
     async def handle(self):
@@ -50,7 +55,12 @@ class AsyncPsqlHandler:
             # Send standard PostgreSQL startup messages
             await self.read_startup_message()
 
-            await self.send_authentication_request()
+            if self.args.auth == "plain":
+                await self.send_plain_text_authentication_request()
+            elif self.args.auth == "md5":
+                await self.send_md5_authentication_request()
+            else:
+                raise ValueError("Unsupported auth type {}".format(args.auth))
             await self.read_authentication()
             await self.send_authentication_ok()
 
@@ -312,12 +322,16 @@ class AsyncPsqlHandler:
         # Read each parameter type (Int32 OIDs)
         for _ in range(num_parameter_types):
             param_type = await self.pgbuf.read_int32()
-            parameter_types.append(field_factory('', param_type))
+            parameter_types.append(field_factory("", param_type))
 
         # For now, let's just log the Parse message details
         # TODO: Validate prepared statement
-        log.info('Parse: Statement Name:%s , Query: %s , Parameter Types: %s',
-                 prepared_statement_name, query, parameter_types)
+        log.info(
+            "Parse: Statement Name:%s , Query: %s , Parameter Types: %s",
+            prepared_statement_name,
+            query,
+            parameter_types,
+        )
 
         # Save the query associated with the statement name
         self.prepared_statements[prepared_statement_name] = {
@@ -385,24 +399,31 @@ class AsyncPsqlHandler:
         await self.pgbuf.read_bytes(length - 4)
 
     async def send_ssl_response(self):
-        """ Send SSL Response.
+        """Send SSL Response.
         b"N" means "Unwilling to perform SSL"
         TODO: Implement server side SSL support
         """
         self.write(b"N")
         await self.writer.drain()
 
-    async def send_authentication_request(self):
+    async def send_plain_text_authentication_request(self):
         """
         Message structure: R83:
-            'R', message type as an authentication request
+            'R', message type as an authentication request (clear text)
             8 (bytes) for the total length of the message
             3 for the remaining integer, indicating a request for a clear text password.
         """
+        self.write(struct.pack("!cii", b"R", 8, AUTH_PLAIN_TEXT))
+        await self.writer.drain()
+
+    async def send_md5_authentication_request(self):
+        """ """
+        salt = os.urandom(4)  # PostgreSQL uses a 4-byte random salt
         self.write(
-            struct.pack("!cii", b"R", 8, AUTH_PLAIN_TEXT)
+            struct.pack(
+                "!cII4s", b"R", 8 + 4, 5, salt
+            )  # 8 bytes: length + md5 message + salt
         )
-        # TODO: Request for MD5 or KERBEROS authentication
         await self.writer.drain()
 
     async def send_authentication_ok(self):
@@ -520,13 +541,17 @@ class AsyncPsqlHandler:
 
 
 # Main server handling
-async def handle_client(reader, writer):
-    handler = AsyncPsqlHandler(reader, writer)
+async def handle_client(reader, writer, args):
+    handler = AsyncPsqlHandler(reader, writer, args)
     await handler.handle()
 
 
-async def main():
-    server = await asyncio.start_server(handle_client, "0.0.0.0", 5001)
+async def main(args):
+    server = await asyncio.start_server(
+        lambda reader, writer: handle_client(reader, writer, args),
+        args.bind,
+        args.port,
+    )
     addr = server.sockets[0].getsockname()
     print(f"Server running on {addr}")
 
@@ -535,7 +560,33 @@ async def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Lemon Proxy")
+    parser.add_argument(
+        "-b",
+        "--bind",
+        help="Address to bind server",
+        required=False,
+        default="localhost",
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        help="Port to bind",
+        required=False,
+        default=5432,
+        type=int,
+    )
+    parser.add_argument(
+        "-a",
+        "--auth",
+        required=False,
+        default="plain",
+        help="Client authentication method (plain, md5)",
+        choices=["plain", "md5"],
+    )
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(args))
     except KeyboardInterrupt:
         print("Server stopped")
