@@ -1,4 +1,8 @@
-class IntField:
+class BaseField:
+    def __repr__(self) -> str:
+        return str(self)
+
+class IntField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 23  # Integer type ID in PostgreSQL
@@ -7,7 +11,7 @@ class IntField:
         return 'Int'
 
 
-class TextField:
+class TextField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 25  # Text type ID in PostgreSQL
@@ -16,7 +20,7 @@ class TextField:
         return 'Text'
 
 
-class OIDField:
+class OIDField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 26  # OID type ID in PostgreSQL
@@ -25,7 +29,7 @@ class OIDField:
         return 'OID'
 
 
-class CharField:
+class CharField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 18  # Char type ID in PostgreSQL
@@ -34,7 +38,7 @@ class CharField:
         return 'Char'
 
 
-class SmallIntField:
+class SmallIntField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 21  # Smallint type ID in PostgreSQL
@@ -43,7 +47,7 @@ class SmallIntField:
         return 'SmallInt'
 
 
-class JSONField:
+class JSONField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 114  # JSON type ID in PostgreSQL
@@ -52,7 +56,7 @@ class JSONField:
         return 'JSON'
 
 
-class XMLField:
+class XMLField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 142  # XML type ID in PostgreSQL
@@ -61,7 +65,7 @@ class XMLField:
         return 'XML'
 
 
-class MoneyField:
+class MoneyField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 790  # Money type ID in PostgreSQL
@@ -70,7 +74,7 @@ class MoneyField:
         return 'Money'
 
 
-class DateArrayField:
+class DateArrayField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1182  # Array of dates type ID in PostgreSQL
@@ -79,7 +83,7 @@ class DateArrayField:
         return 'DateArra'
 
 
-class BitField:
+class BitField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1560  # Bit type ID in PostgreSQL
@@ -88,7 +92,7 @@ class BitField:
         return 'Bit'
 
 
-class NumericField:
+class NumericField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1700  # Numeric type ID in PostgreSQL
@@ -97,7 +101,7 @@ class NumericField:
         return 'Numeric'
 
 
-class Float4Field:
+class Float4Field(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 700  # Real (float4) type ID in PostgreSQL
@@ -106,7 +110,7 @@ class Float4Field:
         return 'Float4'
 
 
-class Float8Field:
+class Float8Field(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 701  # Double precision (float8) type ID in PostgreSQL
@@ -115,7 +119,7 @@ class Float8Field:
         return 'Float8'
 
 
-class BigIntField:
+class BigIntField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 20  # Bigint type ID in PostgreSQL
@@ -124,7 +128,7 @@ class BigIntField:
         return 'BigInt'
 
 
-class VarCharField:
+class VarCharField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1043  # Varchar type ID in PostgreSQL
@@ -133,7 +137,7 @@ class VarCharField:
         return 'VarChar'
 
 
-class IntArrayField:
+class IntArrayField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1005  # Array of integers type ID in PostgreSQL
@@ -142,7 +146,7 @@ class IntArrayField:
         return 'IntArray'
 
 
-class BoolField:
+class BoolField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 16  # Boolean type ID in PostgreSQL
@@ -151,7 +155,7 @@ class BoolField:
         return 'Bool'
 
 
-class TimestampField:
+class TimestampField(BaseField):
     def __init__(self, name):
         self.name = name
         self.type_id = 1114  # Timestamp without time zone type ID in PostgreSQL
