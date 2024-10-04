@@ -105,8 +105,9 @@ class AsyncPsqlHandler:
                     conn.canceling = True
                     return
 
-            breakpoint()
             await self.send_ssl_response()
+            log.info('Reading startup message')
+
             # Send standard PostgreSQL startup messages
             await self.read_startup_message()
 
@@ -119,6 +120,7 @@ class AsyncPsqlHandler:
             else:
                 raise ValueError("Unsupported auth type {}".format(args.auth))
 
+            log.info('Waiting for client authentication')
             if not await self.read_authentication():
                 await self.send_error(
                     severity="FATAL",
@@ -175,6 +177,42 @@ class AsyncPsqlHandler:
             self.writer.close()
             await self.writer.wait_closed()
             connections.pop(self.pid, None)
+
+    async def client_connected_cb(self, reader, writer):
+        # This callback is required for the StreamReaderProtocol
+        pass
+    async def upgrade_to_ssl(self):
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(
+            certfile=self.certificates[0],
+            keyfile=self.certificates[1],
+        )
+
+        transport = self.writer.transport
+        protocol = self.writer.transport.get_protocol()
+
+        loop = asyncio.get_running_loop()  # Get the current running loop
+        new_transport = await loop.start_tls(
+            transport, protocol, ssl_context, server_side=True
+        )
+
+        # Update writer with new secure transport
+        # Hack for Python 3.7
+        self.writer._transport = new_transport
+
+        # new_reader = asyncio.StreamReader()
+        # new_protocol = asyncio.StreamReaderProtocol(
+        #     new_reader, client_connected_cb=self.client_connected_cb
+        # )
+        # new_transport.set_protocol(new_protocol)
+
+        # new_writer = asyncio.StreamWriter(
+        #     new_transport, new_protocol, new_reader, loop
+        # )
+
+        # self.reader = new_reader
+        # self.writer = new_writer
+        # self.pgbuf = PgBuffer(new_reader, new_writer)
 
     async def handle_bind(self):
         # Read message length
@@ -509,6 +547,7 @@ class AsyncPsqlHandler:
         return sslcode == CANCEL_REQUEST_CODE
 
     async def read_startup_message(self):
+        print('>>>>>>', self.pgbuf.reader == self.reader)
         msglen = await self.pgbuf.read_int32()
         version = await self.pgbuf.read_int32()
         v_maj = version >> 16
@@ -572,33 +611,7 @@ class AsyncPsqlHandler:
         self.write(msg)
         await self.writer.drain()
         if self.args.use_ssl:
-            self.handle_ssl_connection()
-
-    async def handle_ssl_connection(self):
-        """Transforma a conexão em segura e inicia a lógica do protocolo pgwire."""
-        # Cria um novo socket seguro a partir do socket original
-        ssl_socket = await self._secure_socket(self.writer)
-        secure_reader = asyncio.StreamReader(ssl_socket)
-        secure_writer = asyncio.StreamWriter(
-            ssl_socket, None, self.writer.transport
-        )
-
-        await self.handle_pgwire_protocol(secure_reader, secure_writer)
-
-    async def _secure_socket(self, writer):
-        """Promove o socket original para SSL."""
-        # Promove a conexão original para SSL
-        ssl_transport = writer.transport
-        ssl_socket = ssl_transport.get_extra_info("socket")
-
-        # Inicia a negociação SSL no socket
-        ssl_socket = ssl.wrap_socket(
-            ssl_socket,
-            server_side=True,
-            certfile=self.certificates[0],
-            keyfile=self.certificates[1],
-        )
-        return ssl_socket
+            await self.upgrade_to_ssl()
 
     async def send_plain_text_authentication_request(self):
         """
@@ -841,15 +854,8 @@ async def main(args):
     # openssl genrsa -out private.key 2048
     # openssl req -new -key private.key -out request.csr
     # openssl x509 -req -days 365 -in request.csr -signkey private.key -out certificate.crt
-    if args.use_ssl:
-        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-        cur_dir = Path.cwd()
-        ssl_context.load_cert_chain(
-            certfile=cur_dir / Path("./etc/certificate.crt"),
-            keyfile=cur_dir / Path("./etc/private.key"),
-        )
-    else:
-        ssl_context = None
+    cur_dir = Path.cwd()
+
     certificates = [
         cur_dir / Path("./etc/certificate.crt"),
         cur_dir / Path("./etc/private.key"),
