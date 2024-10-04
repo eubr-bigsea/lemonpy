@@ -1,48 +1,36 @@
+from pathlib import Path
 import argparse
-
 import asyncio
+import hashlib
 import logging
-import os
+import random
 import re
+import secrets
+import ssl
 import struct
-import yaml
-from sqlglot.expressions import SetItem, Insert, Select, Delete, Var, Identifier
+from gettext import gettext
+from typing import Dict, List
+
 import sqlglot.expressions as exp
-from sqlglot import exp, Expression, errors
+import yaml
+from pg_buffer import PgBuffer
+from pg_data_types import IntField, VarCharField, field_factory
+from sqlglot import Expression, errors
+
+import lemonpy.backends.postgresql as pgsql
 from lemonpy.custom_types import (
+    Config,
     Portal,
     PreparedStatement,
     SessionParameter,
-    Config,
     Source,
 )
 from lemonpy.parser_cmd import get_ast
-from gettext import gettext
-from pg_buffer import PgBuffer
-from pg_data_types import IntField, VarCharField, field_factory
-from typing import Dict, List
 
-logging.basicConfig(format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
-
-# Dictionary mapping PostgreSQL Frontend Message codes to their descriptions
-PSQL_FE_MESSAGES = {
-    "p": "Password message",
-    "Q": "Simple query",
-    "P": "Parse",
-    "B": "Bind",
-    "E": "Execute",
-    "D": "Describe",
-    "C": "Close",
-    "H": "Flush",
-    "S": "Sync",
-    "F": "Function call",
-    "d": "Copy data",
-    "c": "Copy completion",
-    "f": "Copy failure",
-    "X": "Termination",
-}
+log.setLevel(logging.INFO)
 
 SSL_BODY_MAGIC_NUMBER = 80877103
 SSL_DISABLED = 196608
@@ -51,29 +39,40 @@ SSL_BODY_SIZE = 8
 AUTH_KERBEROS_V5 = 2
 AUTH_PLAIN_TEXT = 3
 AUTH_MD5 = 5
+CANCEL_REQUEST_CODE = 80877102
 
 set_command_regex = re.compile(
     r"^\s*SET\s+(LOCAL\s+)?([a-zA-Z_]+(?:\.[a-zA-Z_]+)?)\s*=\s*'?(.*?)'?\s*;?$",
     re.IGNORECASE,
 )
 
+connections = {}
+
 
 # Class to handle PostgreSQL communication asynchronously
 class AsyncPsqlHandler:
     __slots__ = (
+        "application_name",
         "args",
+        "canceling",
+        "client_encoding",
         "config",
+        "current_database",
         "pgbuf",
+        "pid",
         "prepared_statements",
         "portals",
-        "session_parameters",
         "reader",
+        "session_parameters",
+        "session_secret_key",
         "settings",
+        "user",
         "waiting_describe",
         "writer",
+        "certificates",
     )
 
-    def __init__(self, reader, writer, args, config):
+    def __init__(self, reader, writer, args, config, certificates):
         self.config = config
         self.reader = reader
         self.writer = writer
@@ -81,40 +80,51 @@ class AsyncPsqlHandler:
         self.args = args
         self.settings = {}  # Store settings (command SET)
         self.waiting_describe = None
-        # self.prepared_statements = {}  # Store prepared statements
         self.prepared_statements: Dict[str, PreparedStatement] = {}
         self.portals: Dict[str, Portal] = {}
         self.session_parameters: Dict[str, SessionParameter] = {}
+        self.canceling = False
+        self.session_secret_key = None
+        self.pid = random.randint(1000, 64000)
+        self.current_database = None
+        self.client_encoding = "UTF8"
+        self.application_name = None
+        self.user = None
+        self.certificates = certificates
 
     async def handle(self):
         try:
-            await self.read_ssl_request()
+            is_cancel = await self.read_ssl_or_cancel_request()
+
+            if is_cancel:
+                process_id = await self.pgbuf.read_int32()
+                secret_key = await self.pgbuf.read_int32()
+                log.info(f"Cancel query for pid {process_id} {secret_key}.")
+                conn = connections.get(process_id)
+                if conn and conn.session_secret_key == secret_key:
+                    conn.canceling = True
+                    return
+
+            breakpoint()
             await self.send_ssl_response()
             # Send standard PostgreSQL startup messages
             await self.read_startup_message()
 
-            # if self.args.auth == "plain":
-            # await self.send_plain_text_authentication_request()
-            # elif self.args.auth == "md5":
-            #     await self.send_md5_authentication_request()
-            # else:
-            #     raise ValueError("Unsupported auth type {}".format(args.auth))
+            if self.args.auth == "plain":
+                await self.send_plain_text_authentication_request()
+            elif self.args.auth == "md5":
+                await self.send_md5_authentication_request()
+            elif self.args.auth == "scram-sha-256":
+                await self.send_scram_sha_256_authentication_request()
+            else:
+                raise ValueError("Unsupported auth type {}".format(args.auth))
 
-            await self.send_plain_text_authentication_request()
             if not await self.read_authentication():
-                # FIXME: write the username
                 await self.send_error(
                     severity="FATAL",
                     code="28P01",
-                    message=gettext(
-                        'password authentication failed for user "{}"'.format(
-                            "user"
-                        )
-                    ),
+                    message=gettext("password authentication failed for user"),
                 )
-                # self.writer.close()
-                # await self.writer.wait_closed()
-                await asyncio.sleep(2)
             else:
                 await self.send_authentication_ok()
 
@@ -123,6 +133,7 @@ class AsyncPsqlHandler:
 
                 await self.send_ready_for_query()
 
+                connections[self.pid] = self
                 # Main loop to handle incoming messages
                 while True:
                     type_code = await self.pgbuf.read_byte()
@@ -163,6 +174,7 @@ class AsyncPsqlHandler:
         finally:
             self.writer.close()
             await self.writer.wait_closed()
+            connections.pop(self.pid, None)
 
     async def handle_bind(self):
         # Read message length
@@ -212,7 +224,6 @@ class AsyncPsqlHandler:
         await self.send_bind_complete()
 
     def write(self, buffer):
-        # self.debug(buffer)
         self.writer.write(buffer)
 
     async def send_bind_complete(self):
@@ -371,8 +382,6 @@ class AsyncPsqlHandler:
         _ = await self.pgbuf.read_int32()
 
     async def send_ready_for_query(self):
-        # print(">>> ReadToQuery")
-        # 'Z' for ReadyForQuery, 'I' for Idle
         self.write(struct.pack("!cic", b"Z", 5, b"I"))
         await self.writer.drain()
 
@@ -472,6 +481,7 @@ class AsyncPsqlHandler:
                     for v in self.session_parameters.values():
                         print(v)
                     print("=" * 20)
+                await self.send_command_complete(b"SET\x00")
             else:
                 # elif isinstance(expr, (exp.Insert, exp.Delete, exp.Update)):
                 await self.send_error(
@@ -485,28 +495,18 @@ class AsyncPsqlHandler:
                 )
                 return
 
-            # if sql.upper() == b"BEGIN\x00":
-            #     print("BEGIN command received")
-            #     # Send Command Complete message with 'BEGIN'
-            #     await self.send_command_complete(b"BEGIN\x00")
-            #     # Send Ready for Query message indicating the server is ready
-            #     # await self.send_ready_for_query()
-            # else:
-            #     await self.query(sql)
-
-        await self.send_command_complete(b"SET\x00")
-
-    async def read_ssl_request(self):
+    async def read_ssl_or_cancel_request(self):
         msglen = await self.pgbuf.read_int32()
         sslcode = await self.pgbuf.read_int32()
-        # msglen != SSL_BODY_SIZE or
         if sslcode not in (
             SSL_DISABLED,
             SSL_BODY_MAGIC_NUMBER,
+            CANCEL_REQUEST_CODE,
         ):
             raise Exception(
                 f"Unsupported SSL request: {sslcode} { msglen != SSL_BODY_SIZE}"
             )
+        return sslcode == CANCEL_REQUEST_CODE
 
     async def read_startup_message(self):
         msglen = await self.pgbuf.read_int32()
@@ -515,9 +515,17 @@ class AsyncPsqlHandler:
         v_min = version & 0xFFFF
 
         msg = await self.pgbuf.read_parameters(msglen - 8)
-        # TODO: Store inicialization parameters, such as username, schema,
-        # locale, etc
-        print(f"Client PSQL {v_maj}.{v_min} - {msg}")
+        for i in range(len(msg), 2):
+            if msg[i] == b"user":
+                self.user = msg[i + 1].decode()
+            elif msg[i] == b"database":
+                self.current_database = msg[i + 1].decode()
+            elif msg[i] == b"application_name":
+                self.application_name = msg[i + 1].decode()
+            elif msg[i] == b"client_encoding":
+                self.client_encoding = msg[i + 1].decode()
+
+        log.info(f"Client PSQL {v_maj}.{v_min} - {msg}")
 
     async def read_authentication(self):
         type_code = await self.pgbuf.read_byte()
@@ -532,27 +540,65 @@ class AsyncPsqlHandler:
         password = (
             (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
         ).decode()
+        current_password = b"sp33d"  # Senha em bytes
+        username = b"postgres"  # Nome do usuário em bytes
 
-        # TODO: Test if it is a valid password
-        if password != "sp33d":
-            return False
-        else:
-            # TODO: send error message
+        if self.args.auth == "md5":
+            stored = hashlib.md5((current_password + username)).hexdigest()
+            current_password = (
+                "md5"
+                + hashlib.md5(
+                    (stored + str(self.session_secret_key)).encode()
+                ).hexdigest()
+            )
+        elif self.args.auth == "scram-sha-256":
+            # FIXME
             pass
-        # TODO: Implement other auth mechanisms
-        return True
 
-    async def consume_unhandled_message(self):
-        length = await self.pgbuf.read_int32()
-        await self.pgbuf.read_bytes(length - 4)
+        if password != current_password:
+            return False
+        return True
 
     async def send_ssl_response(self):
         """Send SSL Response.
         b"N" means "Unwilling to perform SSL"
-        TODO: Implement server side SSL support
+        b"S" means "Willing to perform SSL".
         """
-        self.write(b"N")
+        if self.args.use_ssl:
+            msg = b"S"
+        else:
+            msg = b"N"
+        log.info("Sending SSL Response  {msg.decode()}")
+        self.write(msg)
         await self.writer.drain()
+        if self.args.use_ssl:
+            self.handle_ssl_connection()
+
+    async def handle_ssl_connection(self):
+        """Transforma a conexão em segura e inicia a lógica do protocolo pgwire."""
+        # Cria um novo socket seguro a partir do socket original
+        ssl_socket = await self._secure_socket(self.writer)
+        secure_reader = asyncio.StreamReader(ssl_socket)
+        secure_writer = asyncio.StreamWriter(
+            ssl_socket, None, self.writer.transport
+        )
+
+        await self.handle_pgwire_protocol(secure_reader, secure_writer)
+
+    async def _secure_socket(self, writer):
+        """Promove o socket original para SSL."""
+        # Promove a conexão original para SSL
+        ssl_transport = writer.transport
+        ssl_socket = ssl_transport.get_extra_info("socket")
+
+        # Inicia a negociação SSL no socket
+        ssl_socket = ssl.wrap_socket(
+            ssl_socket,
+            server_side=True,
+            certfile=self.certificates[0],
+            keyfile=self.certificates[1],
+        )
+        return ssl_socket
 
     async def send_plain_text_authentication_request(self):
         """
@@ -566,7 +612,7 @@ class AsyncPsqlHandler:
 
     async def send_md5_authentication_request(self):
         """ """
-        salt = os.urandom(4)  # PostgreSQL uses a 4-byte random salt
+        salt = str(self.session_secret_key).encode()
         self.write(
             struct.pack(
                 "!cII4s", b"R", 8 + 4, 5, salt
@@ -574,28 +620,24 @@ class AsyncPsqlHandler:
         )
         await self.writer.drain()
 
+    async def send_scram_sha_256_authentication_request(self):
+        """ """
+        raise ValueError("Not implemented")
+
     async def send_authentication_ok(self):
         self.write(struct.pack("!cii", b"R", 8, 0))  # Authentication successful
         await self.writer.drain()
 
-    # async def send_ready_for_query(self):
-    #     self.write(struct.pack("!cic", b'Z', 5, b'I'))  # Ready for query
-    #     await self.writer.drain()
-
-    # async def send_command_complete(self, tag):
-    #     # Command Complete message format: 'C' <int32 length> <tag>
-    #     self.write(struct.pack("!ci", b'C', 4 + len(tag)))
-    #     self.write(tag)
-    #     await self.writer.drain()
-
-    async def send_error(self, severity, code, message):
+    async def send_error(
+        self, severity, code, message, file="", line=-1, command_analyser=""
+    ):
         fields = [
             ("S", severity),
             ("C", code),
             ("M", message),
-            ("F", ""),  # File where error occurred
-            ("L", "1"),  # Line number
-            ("R", "command analyser"),  # Routine name
+            ("F", file),  # File where error occurred
+            ("L", str(line)),  # Line number
+            ("R", command_analyser),  # Routine name
         ]
         error_body = b"".join(
             field_type.encode() + field_value.encode() + b"\x00"
@@ -667,11 +709,10 @@ class AsyncPsqlHandler:
 
     async def send_backend_key_data(self):
         self.write(b"K")
-        # TODO: Secret Key must be a configuration option
-        server_secret_key = 5678
-        self.write(
-            struct.pack("!III", 12, os.getpid(), server_secret_key)
-        )  # Process ID and secret key
+        self.session_secret_key = abs(
+            struct.unpack("!I", secrets.token_bytes(4))[0]
+        )
+        self.write(struct.pack("!III", 12, self.pid, self.session_secret_key))
         await self.writer.drain()
 
     async def send_initial_parameters(self):
@@ -682,7 +723,7 @@ class AsyncPsqlHandler:
             "server_encoding": "UTF8",
             "client_encoding": "UTF8",
             "application_name": "psql",
-            "is_superuser": "on",
+            "is_superuser": "off",
             "session_authorization": "postgres",
             "DateStyle": "ISO, DMY",
             "IntervalStyle": "postgres",
@@ -761,7 +802,12 @@ class AsyncPsqlHandler:
                     self.write(b"D")
                     self.write(struct.pack("!ih", 6 + len(data), len(row)))
                     self.write(data)
+
                     count += 1
+                    if self.canceling:
+                        log.info("Canceling")
+                        self.canceling = False
+                        return
                 await self.send_command_complete(f"SELECT {count}\x00".encode())
                 await self.writer.drain()
             except asyncpg.exceptions.SyntaxOrAccessError as ut:
@@ -775,48 +821,41 @@ class AsyncPsqlHandler:
                 await conn.close()
 
     async def send_pgsql_row_description(self, stmt):
-        type_length = {
-            16: 1,  # bool
-            21: 2,  # int2
-            23: 4,  # int4
-            20: 8,  # int8
-            700: 4,  # float4
-            701: 8,  # float8
-            1043: -1,  # varchar
-            25: -1,  # text
-            # Add more types as needed
-        }
-
-        buf = PgBuffer()
         cols = stmt.get_attributes()
-
-        for i, col in enumerate(cols):
-            buf.write_string(col.name.encode("utf-8"))
-            buf.write_int32(0)  # Table ID
-            buf.write_int16(i + 1)  # Column index
-            buf.write_int32(col.type.oid)
-            buf.write_int16(type_length.get(col.type.oid, -1))  # Column length
-            buf.write_int32(-1)  # Type modifier
-            buf.write_int16(1)  # Text format code
-
-        data = buf.get_buffer()
+        data = pgsql.get_row_description(stmt)
         self.write(b"T")
         self.write(struct.pack("!ih", 6 + len(data), len(cols)))
         self.write(data)
-        # await self.writer.drain()
 
 
 # Main server handling
-async def handle_client(reader, writer, args):
+async def handle_client(reader, writer, args, certificates):
     with open(args.config) as f:
         config = Config.from_dict(yaml.load(f, Loader=yaml.Loader))
-    handler = AsyncPsqlHandler(reader, writer, args, config)
+    handler = AsyncPsqlHandler(reader, writer, args, config, certificates)
     await handler.handle()
 
 
 async def main(args):
+    # To generate certificates
+    # openssl genrsa -out private.key 2048
+    # openssl req -new -key private.key -out request.csr
+    # openssl x509 -req -days 365 -in request.csr -signkey private.key -out certificate.crt
+    if args.use_ssl:
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        cur_dir = Path.cwd()
+        ssl_context.load_cert_chain(
+            certfile=cur_dir / Path("./etc/certificate.crt"),
+            keyfile=cur_dir / Path("./etc/private.key"),
+        )
+    else:
+        ssl_context = None
+    certificates = [
+        cur_dir / Path("./etc/certificate.crt"),
+        cur_dir / Path("./etc/private.key"),
+    ]
     server = await asyncio.start_server(
-        lambda reader, writer: handle_client(reader, writer, args),
+        lambda reader, writer: handle_client(reader, writer, args, certificates),
         args.bind,
         args.port,
     )
@@ -850,7 +889,7 @@ if __name__ == "__main__":
         required=False,
         default="plain",
         help="Client authentication method (plain, md5)",
-        choices=["plain", "md5"],
+        choices=["plain", "md5", "scram-sha-256"],
     )
     parser.add_argument(
         "-c",
@@ -858,6 +897,13 @@ if __name__ == "__main__":
         required=False,
         default="config.yaml",
         help="Configuration file",
+    )
+    parser.add_argument(
+        "--use-ssl",
+        required=False,
+        default=False,
+        help="Use SSL",
+        action="store_true",
     )
     args = parser.parse_args()
 
