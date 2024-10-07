@@ -191,3 +191,18 @@ def field_factory(name, type_id):
         return field_class(name)
     else:
         raise ValueError(f"Unsupported type_id: {type_id}")
+
+class PostgresqlDataType:
+    BOOL = 16
+    INT2 = 21
+    INT4 = 23
+    INT8 = 20
+    FLOAT4 = 700
+    FLOAT8 = 701
+    CHAR = 18
+    VARCHAR = 1043
+    TEXT = 25
+    BYTEA = 17
+    DATE = 1082
+    TIMESTAMP = 1114
+    # Add more types as needed

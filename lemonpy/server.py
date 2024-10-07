@@ -1,3 +1,4 @@
+import datetime
 from pathlib import Path
 import argparse
 import asyncio
@@ -9,12 +10,16 @@ import secrets
 import ssl
 import struct
 from gettext import gettext
-from typing import Dict, List
+from typing import Any, Dict, List
 
 import sqlglot.expressions as exp
 import yaml
 from pg_buffer import PgBuffer
-from pg_data_types import IntField, VarCharField, field_factory
+from pg_data_types import (
+    IntField,
+    PostgresqlDataType,
+    VarCharField,
+)
 from sqlglot import Expression, errors
 
 import lemonpy.backends.postgresql as pgsql
@@ -63,6 +68,7 @@ class AsyncPsqlHandler:
         "prepared_statements",
         "portals",
         "reader",
+        "must_send_row_description",
         "session_parameters",
         "session_secret_key",
         "settings",
@@ -91,6 +97,7 @@ class AsyncPsqlHandler:
         self.application_name = None
         self.user = None
         self.certificates = certificates
+        self.must_send_row_description = False
 
     async def handle(self):
         try:
@@ -106,7 +113,7 @@ class AsyncPsqlHandler:
                     return
 
             await self.send_ssl_response()
-            log.info('Reading startup message')
+            log.info("Reading startup message")
 
             # Send standard PostgreSQL startup messages
             await self.read_startup_message()
@@ -120,7 +127,7 @@ class AsyncPsqlHandler:
             else:
                 raise ValueError("Unsupported auth type {}".format(args.auth))
 
-            log.info('Waiting for client authentication')
+            log.info("Waiting for client authentication")
             if not await self.read_authentication():
                 await self.send_error(
                     severity="FATAL",
@@ -181,6 +188,7 @@ class AsyncPsqlHandler:
     async def client_connected_cb(self, reader, writer):
         # This callback is required for the StreamReaderProtocol
         pass
+
     async def upgrade_to_ssl(self):
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(
@@ -214,6 +222,82 @@ class AsyncPsqlHandler:
         # self.writer = new_writer
         # self.pgbuf = PgBuffer(new_reader, new_writer)
 
+    def value_to_bytes(self, value: Any, data_type: int) -> bytes:
+        if value is None:
+            return struct.pack('!i', -1)
+        elif data_type == PostgresqlDataType.BOOL:
+            return b"\x01" if value else b"\x00"
+        elif data_type in (
+            PostgresqlDataType.INT2,
+            PostgresqlDataType.INT4,
+            PostgresqlDataType.INT8,
+        ):
+            return struct.pack("!q", value)  # Always use 8 bytes for integers
+        elif data_type == PostgresqlDataType.FLOAT4:
+            return struct.pack("!f", value)
+        elif data_type == PostgresqlDataType.FLOAT8:
+            return struct.pack("!d", value)
+        elif data_type in (
+            PostgresqlDataType.CHAR,
+            PostgresqlDataType.VARCHAR,
+            PostgresqlDataType.TEXT,
+        ):
+            return value #.encode("utf-8")
+        elif data_type == PostgresqlDataType.BYTEA:
+            return value
+        elif data_type == PostgresqlDataType.DATE:
+            # Assuming value is a datetime.date object
+            days = (value - datetime.date(2000, 1, 1)).days
+            return struct.pack("!i", days)
+        elif data_type == PostgresqlDataType.TIMESTAMP:
+            # Assuming value is a datetime.datetime object
+            microseconds = int(
+                (value - datetime.datetime(2000, 1, 1)).total_seconds()
+                * 1_000_000
+            )
+            return struct.pack("!q", microseconds)
+        else:
+            # For unhandled types, convert to string and encode
+            return str(value).encode("utf-8")
+
+    def parse_binary_parameter(self, param_data: bytes, param_type: int) -> Any:
+        if param_type == PostgresqlDataType.BOOL:
+            return struct.unpack("!?", param_data)[0]
+        elif param_type == PostgresqlDataType.INT2:
+            return struct.unpack("!h", param_data)[0]
+        elif param_type == PostgresqlDataType.INT4:
+            return struct.unpack("!i", param_data)[0]
+        elif param_type == PostgresqlDataType.INT8:
+            return struct.unpack("!q", param_data)[0]
+        elif param_type == PostgresqlDataType.FLOAT4:
+            return struct.unpack("!f", param_data)[0]
+        elif param_type == PostgresqlDataType.FLOAT8:
+            return struct.unpack("!d", param_data)[0]
+        elif param_type in (
+            PostgresqlDataType.CHAR,
+            PostgresqlDataType.VARCHAR,
+            PostgresqlDataType.TEXT,
+        ):
+            return param_data.decode("utf-8")
+        elif param_type == PostgresqlDataType.BYTEA:
+            return param_data
+        elif param_type == PostgresqlDataType.DATE:
+            # Dates are sent as integers representing the number of days since 2000-01-01
+            days = struct.unpack("!i", param_data)[0]
+            return (
+                datetime.date(2000, 1, 1) + datetime.timedelta(days=days)
+            ).isoformat()
+        elif param_type == PostgresqlDataType.TIMESTAMP:
+            # Timestamps are sent as integers representing microseconds since 2000-01-01
+            microseconds = struct.unpack("!q", param_data)[0]
+            return (
+                datetime.datetime(2000, 1, 1)
+                + datetime.timedelta(microseconds=microseconds)
+            ).isoformat()
+        else:
+            # For unhandled types, return the raw bytes
+            return param_data
+
     async def handle_bind(self):
         # Read message length
         _ = await self.pgbuf.read_int32()
@@ -221,7 +305,6 @@ class AsyncPsqlHandler:
         # Read portal name and prepared statement name (both are null-terminated)
         portal_name = await self.read_null_terminated_string()
         statement_name = await self.read_null_terminated_string()
-        # breakpoint()
 
         # Read the number of parameter format codes
         num_format_codes = await self.pgbuf.read_int16()
@@ -231,10 +314,26 @@ class AsyncPsqlHandler:
 
         # Read the number of parameters
         num_parameters = await self.pgbuf.read_int16()
-        parameters = [
-            await self.pgbuf.read_bytes(await self.pgbuf.read_int32())
-            for _ in range(num_parameters)
-        ]
+        parameters = []
+        ps: PreparedStatement = self.prepared_statements.get(portal_name)
+
+        for i in range(num_parameters):
+            param_length = await self.pgbuf.read_int32()
+            if param_length == -1:
+                parameters.append(None)
+            else:
+                param_data = await self.pgbuf.read_bytes(param_length)
+                # Use format code if available, otherwise default to text
+                format_code = format_codes[i] if i < len(format_codes) else 0
+                if format_code == 0:  # Text format
+                    parameters.append(param_data.decode("utf-8"))
+                else:  # Binary format
+                    log.info("Binary format for parameter")
+                    parameters.append(
+                        self.parse_binary_parameter(
+                            param_data, ps.parameter_types[i]
+                        )
+                    )
 
         # Read the number of result format codes
         num_result_format_codes = await self.pgbuf.read_int16()
@@ -294,9 +393,9 @@ class AsyncPsqlHandler:
                 raise Exception(f"Prepared statement {desc_name} not found.")
 
             # Send RowDescription message
-            await self.send_row_description(
-                fields
-            )  # Modify based on your schema
+            # await self.send_row_description(
+            #     fields
+            # )  # Modify based on your schema
         elif desc_type == b"P":
             # Describe a portal
             print(desc_name)
@@ -305,16 +404,19 @@ class AsyncPsqlHandler:
                 raise Exception(f"Portal {desc_name} not found.")
 
             # Send RowDescription message for the portal
-            await self.send_row_description(
-                fields
-            )  # Modify based on your schema
+            # await self.send_row_description(
+            #     fields
+            # )  # Modify based on your schema
+        else:
+            raise Exception(f"Invalid describe type {desc_type}")
 
+        self.must_send_row_description = True
         # Send Describe Complete
-        await self.send_describe_complete()
+        # await self.send_describe_complete()
 
-    async def send_describe_complete(self):
-        self.write(struct.pack("!ci", b"3", 4))  # '3' for DescribeComplete
-        await self.writer.drain()
+    # async def send_describe_complete(self):
+    #     self.write(struct.pack("!ci", b"3", 4))  # '3' for DescribeComplete
+    #     await self.writer.drain()
 
     async def handle_set_command(self, match):
         self.settings[match.group(2)] = [
@@ -356,18 +458,20 @@ class AsyncPsqlHandler:
             return
 
         # Look up the portal in prepared_statements
-        portal = self.prepared_statements.get(portal_name)
+        ps: PreparedStatement = self.prepared_statements.get(portal_name)
+        portal: Portal = self.portals.get(portal_name)
 
-        sql = portal.query.strip("\0")  # Assuming portal contains the query
-        match = set_command_regex.match(sql)
+        sql = ps.query.strip("\0")  # Assuming portal contains the query
 
         # print("=" * 20)
         # print(self.prepared_statements)
-        # print(portal)
-        # print('>>>', sql, match)
+        # print(ps)
         # print("=" * 20)
 
+        await self._handle_query(sql, portal.parameters)
+        return
         # FIXME Implement execute
+        match = set_command_regex.match(sql)
         if match:
             # Handle SET command
             await self.handle_set_command(match)
@@ -409,7 +513,7 @@ class AsyncPsqlHandler:
         # await self.send_ready_for_query()
 
     async def send_command_complete(self, tag):
-        print("send_command_complte", tag)
+        log.info("Send command complete %s", tag)
         # await self.debug(struct.pack("!ci", b"C", 4 + len(tag)))
         self.write(struct.pack("!ci", b"C", 4 + len(tag)))
         self.write(tag)
@@ -462,7 +566,8 @@ class AsyncPsqlHandler:
         # Read each parameter type (Int32 OIDs)
         for _ in range(num_parameter_types):
             param_type = await self.pgbuf.read_int32()
-            parameter_types.append(field_factory("", param_type))
+            # parameter_types.append(field_factory("", param_type))
+            parameter_types.append(param_type)
 
         # For now, let's just log the Parse message details
         # TODO: Validate prepared statement
@@ -492,6 +597,11 @@ class AsyncPsqlHandler:
         msglen = await self.pgbuf.read_int32()
         sql = (await self.pgbuf.read_bytes(msglen - 4)).decode().strip("\0")
 
+        await self._handle_query(sql)
+
+    async def _handle_query(self, sql, params=None):
+        if params is None:
+            params = []
         expr: Expression = None
         try:
             expr_list: List[Expression] = get_ast(sql)
@@ -511,14 +621,14 @@ class AsyncPsqlHandler:
             return
         for expr in expr_list:
             if isinstance(expr, exp.Select):
-                return await self.execute_select(sql)
+                return await self.execute_select(sql, params)
             elif isinstance(expr, exp.Set):
                 for set_item in expr.find_all(exp.SetItem):
                     self.set_parameter(set_item)
-                    print("=" * 20)
-                    for v in self.session_parameters.values():
-                        print(v)
-                    print("=" * 20)
+                    # print("=" * 20)
+                    # for v in self.session_parameters.values():
+                    #     print(v)
+                    # print("=" * 20)
                 await self.send_command_complete(b"SET\x00")
             else:
                 # elif isinstance(expr, (exp.Insert, exp.Delete, exp.Update)):
@@ -547,7 +657,7 @@ class AsyncPsqlHandler:
         return sslcode == CANCEL_REQUEST_CODE
 
     async def read_startup_message(self):
-        print('>>>>>>', self.pgbuf.reader == self.reader)
+        print(">>>>>>", self.pgbuf.reader == self.reader)
         msglen = await self.pgbuf.read_int32()
         version = await self.pgbuf.read_int32()
         v_maj = version >> 16
@@ -681,37 +791,45 @@ class AsyncPsqlHandler:
     #     self.write(data)
     #     await self.writer.drain()
 
-    async def send_row_data(self, rows):
-        for row in rows:
-            buf = PgBuffer()
-            for field in row:
-                v = str(field).encode()
-                buf.write_int32(len(v))
-                buf.write_bytes(v)
-            data = buf.get_buffer()
+    # async def send_row_data(self, rows):
+    #     for row in rows:
+    #         buf = PgBuffer()
+    #         for field in row:
+    #             if field is None:
+    #                 v = b'\x00'
+    #             elif isinstance(field, bool):
+    #                 v = b'\x01' if field else b'\x00'  # Boolean value
+    #             elif str(field) in ('True', 'False'):
+    #                 breakpoint()
+    #                 v = str(field).encode()
+    #             else:
+    #                 v = str(field).encode()
+    #             buf.write_int32(len(v))
+    #             buf.write_bytes(v)
+    #         data = buf.get_buffer()
 
-            self.write(b"D")
-            self.write(struct.pack("!ih", 6 + len(data), len(row)))
-            self.write(data)
-        await self.writer.drain()
+    #         self.write(b"D")
+    #         self.write(struct.pack("!ih", 6 + len(data), len(row)))
+    #         self.write(data)
+    #     await self.writer.drain()
 
-    async def query(self, sql):
-        fields = [IntField("a"), IntField("b")]  # Define column headers
-        rows = [[1, 2], [3, 4], [5, 6]]  # Example result set
+    # async def query(self, sql):
+    #     fields = [IntField("a"), IntField("b")]  # Define column headers
+    #     rows = [[1, 2], [3, 4], [5, 6]]  # Example result set
 
-        # 1. Send row description (Column names and types)
-        await self.send_row_description(fields)
+    #     # 1. Send row description (Column names and types)
+    #     await self.send_row_description(fields)
 
-        # 2. Send actual rows
-        await self.send_row_data(rows)
+    #     # 2. Send actual rows
+    #     await self.send_row_data(rows)
 
-        # 3. Send command complete with a valid completion tag, e.g., "SELECT n"
-        await self.send_command_complete(
-            b"SELECT 3\x00"
-        )  # Indicates 3 rows returned
+    #     # 3. Send command complete with a valid completion tag, e.g., "SELECT n"
+    #     await self.send_command_complete(
+    #         b"SELECT 3\x00"
+    #     )  # Indicates 3 rows returned
 
-        # 4. Send Ready for Query (status indicator)
-        # await self.send_ready_for_query()
+    #     # 4. Send Ready for Query (status indicator)
+    #     # await self.send_ready_for_query()
 
     async def send_parameter_status(self, parameter, value):
         message = f"{parameter}\x00{value}\x00".encode()
@@ -766,9 +884,11 @@ class AsyncPsqlHandler:
             is_local=True,
         )
 
-    async def execute_select(self, sql: str):
+    async def execute_select(self, sql: str, params: List[any] = None):
         """Execute SQL Selects"""
 
+        if params is None:
+            params = []
         # TODO:
         # For each table in sql, query information in catalog, test if there are
         # access rules, transformations, virtual tables, etc. Retrieve the
@@ -798,18 +918,39 @@ class AsyncPsqlHandler:
                     format="text",
                 )
             try:
+                if params:
+                    log.info(
+                        f"\033[32mExecuting\n{sql}\nWith params: {repr(params)}\033[m"
+                    )
+                else:
+                    log.info(f"\033[32mExecuting\n{sql}\033[m")
                 stmt = await conn.prepare(sql)
-                result = await stmt.fetch()
+                result = await stmt.fetch(*params)
                 await self.send_pgsql_row_description(stmt)
+
+                meta = stmt.get_attributes()
                 count = 0
 
                 for row in result:
                     buf = PgBuffer()
-                    for col in row:
-                        # print(col, str(col), type(col))
-                        v = str(col).encode()
-                        buf.write_int32(len(v))
-                        buf.write_bytes(v)
+                    for col_inx, col in enumerate(row):
+                        value_bytes = self.value_to_bytes(
+                            col, meta[col_inx].type.oid
+                        )
+                        # if col is None:
+                        #     v = struct.pack("!i", -1)
+                        # elif isinstance(col, bool):
+                        #     v = b"\x01" if col else b"\x00"  # Boolean value
+                        # elif str(col) in ("True", "False"):
+                        #     breakpoint()
+                        #     v = str(col).encode()
+                        # else:
+                        #     v = str(col).encode()
+                        buf.write_int32(len(value_bytes))
+                        if isinstance(value_bytes, str):
+                            buf.write_bytes(value_bytes.encode())
+                        else:
+                            buf.write_bytes(value_bytes)
                     data = buf.get_buffer()
 
                     self.write(b"D")
@@ -850,10 +991,6 @@ async def handle_client(reader, writer, args, certificates):
 
 
 async def main(args):
-    # To generate certificates
-    # openssl genrsa -out private.key 2048
-    # openssl req -new -key private.key -out request.csr
-    # openssl x509 -req -days 365 -in request.csr -signkey private.key -out certificate.crt
     cur_dir = Path.cwd()
 
     certificates = [
