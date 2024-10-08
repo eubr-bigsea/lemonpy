@@ -33,10 +33,13 @@ class Role:
 @dataclass
 class Column:
     name: str
-    roles: List[Role]
+    type: str
+    size: int = -1
+    roles: List[Role] = field(default_factory=list)
 
-class Duration:
-    ...
+
+class Duration: ...
+
 
 @dataclass
 class CacheControl:
@@ -45,32 +48,40 @@ class CacheControl:
     ttl: Duration
     parameters: List[str]
 
+
+class Relation:
+    pass
+
+
 @dataclass
-class Table:
+class Table(Relation):
     name: str
     view: str
-    cache_control: CacheControl
-    columns: List[Column]
+    cache_control: CacheControl = None
+    columns: Dict[str, Column] = field(default_factory=dict)
 
 
 @dataclass
 class Schema:
     name: str
-    tables: List[Table]
+    tables: Dict[str, Table] = field(default_factory=dict)
+    views: Dict[str, Table] = field(default_factory=dict)
 
 
 @dataclass
 class Database:
     name: str
-    schemas: List[Schema]
+    schemas: Dict[str, Schema] = field(default_factory=dict)
 
 
 @dataclass
 class Catalog:
     name: str
     source_name: str
-    databases: List[Database]
+    databases: Dict[str, Database] = field(default_factory=dict)
 
+    def d(self, name: str) -> Database:
+        return self.databases.get(name)
 
 @dataclass
 class Config:
@@ -86,7 +97,7 @@ class Config:
                     for (k, v) in data.get("sources", []).items()
                 ]
             ),
-            catalogs={}
+            catalogs={},
         )
 
     def get_source(self, name: str) -> Source:

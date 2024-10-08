@@ -2,3 +2,4 @@ sqlglot==25.0.3
 sqlglot[rs]
 asyncpg==0.29.0
 pyyaml==6.0.2
+ansicolors==1.1.8

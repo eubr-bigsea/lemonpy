@@ -2,9 +2,30 @@ from sqlglot.expressions import Set, Insert, Select, Delete, Expression
 import sqlglot
 from typing import List
 
+import sqlglot.optimizer
+import sqlglot.schema
 
-def get_ast(sql: str) -> List[Expression]:
-    return sqlglot.parse(sql=sql)
+
+def get_ast(sql: str, dialect: str) -> List[Expression]:
+    return sqlglot.parse(sql=sql, dialect=dialect)
+
+
+def optimize(expr: Expression, **kwargs) -> Expression:
+    from sqlglot.optimizer import Optimizer
+
+    # Create an Optimizer instance with a specific optimization disabled
+    optimizer = Optimizer(disable=["optimization_name"])
+    return sqlglot.optimizer.optimize(expr, optimizer=optimizer, **kwargs)
+
+
+def get_all(ast: Expression, type: Expression) -> Expression:
+    root = sqlglot.optimizer.build_scope(ast)
+    return [
+        source
+        for scope in root.traverse()
+        for alias, (node, source) in scope.selected_sources.items()
+        if isinstance(source, type)
+    ]
 
 
 def describe(parsed_query: Expression, catalog: any):

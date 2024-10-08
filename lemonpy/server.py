@@ -1,7 +1,6 @@
-import datetime
-from pathlib import Path
 import argparse
 import asyncio
+import datetime
 import hashlib
 import logging
 import random
@@ -10,19 +9,23 @@ import secrets
 import ssl
 import struct
 from gettext import gettext
+from pathlib import Path
 from typing import Any, Dict, List
 
+import sqlglot
+import sqlglot.expressions
 import sqlglot.expressions as exp
 import yaml
+from colors import color
 from pg_buffer import PgBuffer
 from pg_data_types import (
     IntField,
     PostgresqlDataType,
-    VarCharField,
 )
 from sqlglot import Expression, errors
 
 import lemonpy.backends.postgresql as pgsql
+from lemonpy.catalog.file_catalog import FileCatalog
 from lemonpy.custom_types import (
     Config,
     Portal,
@@ -30,7 +33,7 @@ from lemonpy.custom_types import (
     SessionParameter,
     Source,
 )
-from lemonpy.parser_cmd import get_ast
+from lemonpy.parser_cmd import get_all, get_ast, optimize
 
 logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
@@ -59,10 +62,14 @@ class AsyncPsqlHandler:
     __slots__ = (
         "application_name",
         "args",
+        "binary_transfer",
         "canceling",
+        "catalog",
+        "certificates",
         "client_encoding",
         "config",
         "current_database",
+        "current_schema",
         "pgbuf",
         "pid",
         "prepared_statements",
@@ -75,29 +82,37 @@ class AsyncPsqlHandler:
         "user",
         "waiting_describe",
         "writer",
-        "certificates",
     )
 
-    def __init__(self, reader, writer, args, config, certificates):
+    def __init__(self, reader, writer, args, config, certificates, catalog):
         self.config = config
+        self.args = args
+
         self.reader = reader
         self.writer = writer
         self.pgbuf = PgBuffer(reader, writer)
-        self.args = args
-        self.settings = {}  # Store settings (command SET)
-        self.waiting_describe = None
+
+        self.certificates = certificates
+        self.catalog = catalog
+
         self.prepared_statements: Dict[str, PreparedStatement] = {}
         self.portals: Dict[str, Portal] = {}
         self.session_parameters: Dict[str, SessionParameter] = {}
+
+        self.must_send_row_description = False
+        self.waiting_describe = None
+        self.client_encoding = "UTF8"
+        self.user = None
+        self.binary_transfer = False
+
         self.canceling = False
+
         self.session_secret_key = None
         self.pid = random.randint(1000, 64000)
+
         self.current_database = None
-        self.client_encoding = "UTF8"
+        self.current_schema = "public"
         self.application_name = None
-        self.user = None
-        self.certificates = certificates
-        self.must_send_row_description = False
 
     async def handle(self):
         try:
@@ -224,7 +239,7 @@ class AsyncPsqlHandler:
 
     def value_to_bytes(self, value: Any, data_type: int) -> bytes:
         if value is None:
-            return struct.pack('!i', -1)
+            return struct.pack("!i", -1)
         elif data_type == PostgresqlDataType.BOOL:
             return b"\x01" if value else b"\x00"
         elif data_type in (
@@ -242,7 +257,7 @@ class AsyncPsqlHandler:
             PostgresqlDataType.VARCHAR,
             PostgresqlDataType.TEXT,
         ):
-            return value #.encode("utf-8")
+            return value  # .encode("utf-8")
         elif data_type == PostgresqlDataType.BYTEA:
             return value
         elif data_type == PostgresqlDataType.DATE:
@@ -418,17 +433,6 @@ class AsyncPsqlHandler:
     #     self.write(struct.pack("!ci", b"3", 4))  # '3' for DescribeComplete
     #     await self.writer.drain()
 
-    async def handle_set_command(self, match):
-        self.settings[match.group(2)] = [
-            match.group(1) is not None
-            and "LOCAL" == match.group(1).strip().upper(),
-            match.group(3),
-        ]
-        print(f"Executing SET command: {self.settings}")
-
-        # Send CommandComplete message
-        await self.send_command_complete("SET\x00".encode())
-
     async def handle_execute(self):
         # Read the length of the entire Execute message
         msglen = await self.pgbuf.read_int32()
@@ -469,48 +473,6 @@ class AsyncPsqlHandler:
         # print("=" * 20)
 
         await self._handle_query(sql, portal.parameters)
-        return
-        # FIXME Implement execute
-        match = set_command_regex.match(sql)
-        if match:
-            # Handle SET command
-            await self.handle_set_command(match)
-        elif sql.strip() == "SELECT current_schema(),session_user":
-            # FIXME Handle common queries
-            rows = [["public", "postgres"]]
-            if self.waiting_describe:
-                await self.handle_describe(
-                    [
-                        VarCharField("current_schema"),
-                        VarCharField("session_user"),
-                    ]
-                )
-
-            # 2. Send actual rows
-            await self.send_row_data(rows)
-            # 3. Send command complete with a valid completion tag, e.g., "SELECT n"
-            await self.send_command_complete(
-                f"SELECT {len(rows)}\x00".encode()
-            )  # Indicates 3 rows returned
-
-        else:
-            if self.waiting_describe:
-                await self.handle_describe()
-            print(f"Executing portal {portal_name}, max_rows: {max_rows}")
-            # Execute the query associated with the portal
-            # For now, this is a mock implementation
-            # You should replace this with actual query execution based on the portal
-            rows = [[1, 2], [3, 4], [5, 6]] if max_rows == 0 else [[1, 2]]
-
-            # Send RowData for the rows
-            await self.send_row_data(rows)
-
-            # Send CommandComplete message
-            await self.send_command_complete("SELECT\x00".encode())
-
-        self.waiting_describe = False
-        # Optionally, send ReadyForQuery after completion
-        # await self.send_ready_for_query()
 
     async def send_command_complete(self, tag):
         log.info("Send command complete %s", tag)
@@ -602,9 +564,11 @@ class AsyncPsqlHandler:
     async def _handle_query(self, sql, params=None):
         if params is None:
             params = []
+
         expr: Expression = None
+
         try:
-            expr_list: List[Expression] = get_ast(sql)
+            expr_list: List[Expression] = get_ast(sql, "postgres")
         except errors.ParseError as pe:
             e = pe.errors[0]
             await self.send_error(
@@ -621,7 +585,31 @@ class AsyncPsqlHandler:
             return
         for expr in expr_list:
             if isinstance(expr, exp.Select):
-                return await self.execute_select(sql, params)
+                # Improving select
+
+                # Notice: in sqlglot, catalog = database and db = schema
+                new_expr = optimize(
+                    expr,
+                    dialect="postgres",
+                    # schema=default_schema,
+                    catalog=sqlglot.expressions.Identifier(
+                        this=self.current_database
+                    ),
+                    db=sqlglot.expressions.Identifier(this=self.current_schema),
+                )
+                tables = get_all(new_expr, exp.Table)
+                print("=" * 10)
+                print(new_expr.sql())
+                print(tables)
+                # Here, db is schema and catalog is database
+                for table in tables:
+                    # Validate table db, schema and name (they are in catalog)
+                    if False:
+                        pass
+                        # Send error
+                    print(table.db, table.catalog, table.name)
+                print("=" * 10)
+                return await self.execute_select(new_expr.sql(), params)
             elif isinstance(expr, exp.Set):
                 for set_item in expr.find_all(exp.SetItem):
                     self.set_parameter(set_item)
@@ -630,6 +618,24 @@ class AsyncPsqlHandler:
                     #     print(v)
                     # print("=" * 20)
                 await self.send_command_complete(b"SET\x00")
+            elif isinstance(expr, exp.Use):
+                parts = [
+                    i.name for i in expr.find_all(sqlglot.expressions.Identifier)
+                ]
+                if len(parts) == 1:
+                    self.current_database = parts[0]
+                elif len(parts) == 2:
+                    self.current_database = parts[1]
+                    self.current_schema = parts[0]
+                else:
+                    await self.send_error(
+                        severity="FATAL",
+                        code="28P01",  # FIXME
+                        message=gettext(
+                            "Syntax error. USE accepts only "
+                            "database or database.schema format"
+                        ),
+                    )
             else:
                 # elif isinstance(expr, (exp.Insert, exp.Delete, exp.Update)):
                 await self.send_error(
@@ -664,7 +670,7 @@ class AsyncPsqlHandler:
         v_min = version & 0xFFFF
 
         msg = await self.pgbuf.read_parameters(msglen - 8)
-        for i in range(len(msg), 2):
+        for i in range(0, len(msg), 2):
             if msg[i] == b"user":
                 self.user = msg[i + 1].decode()
             elif msg[i] == b"database":
@@ -675,6 +681,8 @@ class AsyncPsqlHandler:
                 self.client_encoding = msg[i + 1].decode()
 
         log.info(f"Client PSQL {v_maj}.{v_min} - {msg}")
+        # Test if client supports binary encoding of cols value
+        self.binary_transfer = b"binary" in msg
 
     async def read_authentication(self):
         type_code = await self.pgbuf.read_byte()
@@ -774,63 +782,6 @@ class AsyncPsqlHandler:
         self.write(error_body)
         await self.writer.drain()
 
-    # async def send_row_description(self, fields):
-    #     buf = PgBuffer()
-    #     for field in fields:
-    #         buf.write_string(field.name)
-    #         buf.write_int32(0)  # Table ID
-    #         buf.write_int16(0)  # Column ID
-    #         buf.write_int32(field.type_id)
-    #         buf.write_int16(field.type_size)
-    #         buf.write_int32(-1)  # Type modifier
-    #         buf.write_int16(0)  # Text format code
-    #     data = buf.get_buffer()
-
-    #     self.write(b"T")
-    #     self.write(struct.pack("!ih", 6 + len(data), len(fields)))
-    #     self.write(data)
-    #     await self.writer.drain()
-
-    # async def send_row_data(self, rows):
-    #     for row in rows:
-    #         buf = PgBuffer()
-    #         for field in row:
-    #             if field is None:
-    #                 v = b'\x00'
-    #             elif isinstance(field, bool):
-    #                 v = b'\x01' if field else b'\x00'  # Boolean value
-    #             elif str(field) in ('True', 'False'):
-    #                 breakpoint()
-    #                 v = str(field).encode()
-    #             else:
-    #                 v = str(field).encode()
-    #             buf.write_int32(len(v))
-    #             buf.write_bytes(v)
-    #         data = buf.get_buffer()
-
-    #         self.write(b"D")
-    #         self.write(struct.pack("!ih", 6 + len(data), len(row)))
-    #         self.write(data)
-    #     await self.writer.drain()
-
-    # async def query(self, sql):
-    #     fields = [IntField("a"), IntField("b")]  # Define column headers
-    #     rows = [[1, 2], [3, 4], [5, 6]]  # Example result set
-
-    #     # 1. Send row description (Column names and types)
-    #     await self.send_row_description(fields)
-
-    #     # 2. Send actual rows
-    #     await self.send_row_data(rows)
-
-    #     # 3. Send command complete with a valid completion tag, e.g., "SELECT n"
-    #     await self.send_command_complete(
-    #         b"SELECT 3\x00"
-    #     )  # Indicates 3 rows returned
-
-    #     # 4. Send Ready for Query (status indicator)
-    #     # await self.send_ready_for_query()
-
     async def send_parameter_status(self, parameter, value):
         message = f"{parameter}\x00{value}\x00".encode()
         self.write(b"S")
@@ -920,7 +871,10 @@ class AsyncPsqlHandler:
             try:
                 if params:
                     log.info(
-                        f"\033[32mExecuting\n{sql}\nWith params: {repr(params)}\033[m"
+                        color(
+                            f"Executing\n{sql}\nWith params: {repr(params)}",
+                            fg="green",
+                        )
                     )
                 else:
                     log.info(f"\033[32mExecuting\n{sql}\033[m")
@@ -934,18 +888,17 @@ class AsyncPsqlHandler:
                 for row in result:
                     buf = PgBuffer()
                     for col_inx, col in enumerate(row):
-                        value_bytes = self.value_to_bytes(
-                            col, meta[col_inx].type.oid
-                        )
-                        # if col is None:
-                        #     v = struct.pack("!i", -1)
-                        # elif isinstance(col, bool):
-                        #     v = b"\x01" if col else b"\x00"  # Boolean value
-                        # elif str(col) in ("True", "False"):
-                        #     breakpoint()
-                        #     v = str(col).encode()
-                        # else:
-                        #     v = str(col).encode()
+                        if self.binary_transfer:
+                            value_bytes = self.value_to_bytes(
+                                col, meta[col_inx].type.oid
+                            )
+                        else:
+                            if col is None:
+                                value_bytes = struct.pack("!i", -1)
+                            elif isinstance(col, bool):
+                                value_bytes = b"\x01" if col else b"\x00"
+                            else:
+                                value_bytes = str(col).encode()
                         buf.write_int32(len(value_bytes))
                         if isinstance(value_bytes, str):
                             buf.write_bytes(value_bytes.encode())
@@ -983,17 +936,30 @@ class AsyncPsqlHandler:
 
 
 # Main server handling
-async def handle_client(reader, writer, args, certificates):
+async def handle_client(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    args: argparse.Namespace,
+    certificates: List[Path],
+) -> None:
     with open(args.config) as f:
         config = Config.from_dict(yaml.load(f, Loader=yaml.Loader))
-    handler = AsyncPsqlHandler(reader, writer, args, config, certificates)
+    catalog_type: str = config.get("catalog", {"file"}).get("type", "file")
+    if catalog_type == "file":
+        catalog = FileCatalog(config.get("catalog", {}).get("path")).build()
+    else:
+        catalog = None
+
+    handler = AsyncPsqlHandler(
+        reader, writer, args, config, certificates, catalog
+    )
     await handler.handle()
 
 
-async def main(args):
+async def main(args: argparse.Namespace) -> None:
     cur_dir = Path.cwd()
 
-    certificates = [
+    certificates: List[Path] = [
         cur_dir / Path("./etc/certificate.crt"),
         cur_dir / Path("./etc/private.key"),
     ]
@@ -1048,7 +1014,7 @@ if __name__ == "__main__":
         help="Use SSL",
         action="store_true",
     )
-    args = parser.parse_args()
+    args: argparse.Namespace = parser.parse_args()
 
     try:
         asyncio.run(main(args))
