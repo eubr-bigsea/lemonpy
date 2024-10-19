@@ -11,11 +11,12 @@ def get_ast(sql: str, dialect: str) -> List[Expression]:
 
 
 def optimize(expr: Expression, **kwargs) -> Expression:
-    from sqlglot.optimizer import Optimizer
+    # from sqlglot.optimizer import Optimizer
 
     # Create an Optimizer instance with a specific optimization disabled
-    optimizer = Optimizer(disable=["optimization_name"])
-    return sqlglot.optimizer.optimize(expr, optimizer=optimizer, **kwargs)
+    #optimizer = Optimizer(disable=["optimization_name"])
+    # return sqlglot.optimizer.optimize(expr, optimizer=optimizer, **kwargs)
+    return sqlglot.optimizer.optimize(expr, **kwargs)
 
 
 def get_all(ast: Expression, type: Expression) -> Expression:

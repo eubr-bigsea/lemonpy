@@ -84,9 +84,14 @@ class Catalog:
         return self.databases.get(name)
 
 @dataclass
+class CatalogInfo:
+    type: str
+    path: str
+
+@dataclass
 class Config:
     sources: Dict[str, Source]
-    catalogs: Dict[str, Catalog]
+    catalog: CatalogInfo
 
     @classmethod
     def from_dict(cls, data) -> None:
@@ -97,7 +102,7 @@ class Config:
                     for (k, v) in data.get("sources", []).items()
                 ]
             ),
-            catalogs={},
+            catalog=CatalogInfo(**data.get("catalog")),
         )
 
     def get_source(self, name: str) -> Source:

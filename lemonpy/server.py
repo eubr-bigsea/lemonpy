@@ -944,9 +944,9 @@ async def handle_client(
 ) -> None:
     with open(args.config) as f:
         config = Config.from_dict(yaml.load(f, Loader=yaml.Loader))
-    catalog_type: str = config.get("catalog", {"file"}).get("type", "file")
+    catalog_type: str = config.catalog.type
     if catalog_type == "file":
-        catalog = FileCatalog(config.get("catalog", {}).get("path")).build()
+        catalog = FileCatalog(config.catalog.path).build()
     else:
         catalog = None
 
