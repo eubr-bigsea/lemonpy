@@ -35,6 +35,13 @@ from lemonpy.custom_types import (
 )
 from lemonpy.parser_cmd import get_all, get_ast, optimize
 
+from validation import (
+    load_catalog,
+    validate_same_database,
+    validate_table_in_catalog,
+    validate_columns_in_catalog
+)
+
 logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
@@ -562,6 +569,9 @@ class AsyncPsqlHandler:
         await self._handle_query(sql)
 
     async def _handle_query(self, sql, params=None):
+         
+        catalog = load_catalog("../catalog.yaml")
+
         if params is None:
             params = []
 
@@ -585,9 +595,15 @@ class AsyncPsqlHandler:
             return
         for expr in expr_list:
             if isinstance(expr, exp.Select):
+
+                #tables = get_all(expr, exp.Table)
+                #validate_same_database(tables, self.current_database)
+                #validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                #validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
                 # Improving select
 
                 # Notice: in sqlglot, catalog = database and db = schema
+                #usar o new_expr
                 new_expr = optimize(
                     expr,
                     dialect="postgres",
@@ -601,6 +617,12 @@ class AsyncPsqlHandler:
                 print("=" * 10)
                 print(new_expr.sql())
                 print(tables)
+
+                # Query validations
+                validate_same_database(tables, self.current_database)
+                validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+
                 # Here, db is schema and catalog is database
                 for table in tables:
                     # Validate table db, schema and name (they are in catalog)
@@ -696,7 +718,8 @@ class AsyncPsqlHandler:
         msglen = await self.pgbuf.read_int32()
         password = (
             (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
-        ).decode()
+        )
+
         current_password = b"sp33d"  # Senha em bytes
         username = b"postgres"  # Nome do usuário em bytes
 

@@ -78,6 +78,10 @@ celerybeat-schedule
 venv/
 ENV/
 
+# Ignore confidential files
+catalog.yaml
+config.yaml
+
 # Spyder project settings
 .spyderproject
 
