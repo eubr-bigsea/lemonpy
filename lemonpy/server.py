@@ -596,12 +596,7 @@ class AsyncPsqlHandler:
         for expr in expr_list:
             if isinstance(expr, exp.Select):
 
-                #tables = get_all(expr, exp.Table)
-                #validate_same_database(tables, self.current_database)
-                #validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
-                #validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
                 # Improving select
-
                 # Notice: in sqlglot, catalog = database and db = schema
                 #usar o new_expr
                 new_expr = optimize(
@@ -614,14 +609,29 @@ class AsyncPsqlHandler:
                     db=sqlglot.expressions.Identifier(this=self.current_schema),
                 )
                 tables = get_all(new_expr, exp.Table)
+                # Query validations
+                try:
+                    validate_same_database(tables, self.current_database)
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                try:
+                    validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                except ValueError as e:
+                    self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                try:
+                    await validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
                 print("=" * 10)
                 print(new_expr.sql())
                 print(tables)
 
-                # Query validations
-                validate_same_database(tables, self.current_database)
-                validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
-                validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+                #validate_same_database(tables, self.current_database)
+                #validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                #validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
 
                 # Here, db is schema and catalog is database
                 for table in tables:
