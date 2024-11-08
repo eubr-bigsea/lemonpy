@@ -618,13 +618,15 @@ class AsyncPsqlHandler:
                 try:
                     validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
                 except ValueError as e:
-                    self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
                     return
+                
                 try:
-                    await validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+                    validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
                 except ValueError as e:
                     await self.send_error(severity="FATAL", code="28P01", message=str(e))
                     return
+                
                 print("=" * 10)
                 print(new_expr.sql())
                 print(tables)

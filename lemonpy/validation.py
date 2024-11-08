@@ -1,5 +1,6 @@
 import sqlglot
 from sqlglot.expressions import Table
+from sqlglot import expressions as exp
 from typing import List, Dict
 from gettext import gettext
 import yaml
@@ -31,24 +32,23 @@ def validate_table_in_catalog(tables: List[Table], catalog: Dict, current_db: st
         schema = table.db 
         table_name = table.name
 
-        if db not in catalog or schema not in catalog[db]['schemas'] or table_name not in catalog[db]['schemas'][schema]['tables']:
+        if  table_name not in catalog['catalogs']['default']['databases'][db]['schemas'][schema]['tables']:
             raise ValueError(gettext("Table {} is not in the catalog in database {}, schema {}").format(table_name, db, schema))
 
-
 def validate_columns_in_catalog(expr, catalog: Dict, current_db: str, current_schema: str) -> None:
-   
-    for table in sqlglot.get_all(expr, Table):
-        
+
+    for table in expr.find_all(exp.Table):
+
         db = table.catalog or current_db
         schema = table.db or current_schema
         table_name = table.name
 
-        catalog_columns = catalog[db]['schemas'][schema]['tables'][table_name]['columns']
+        catalog_columns = catalog['catalogs']['default']['databases'][db]['schemas'][schema]['tables'][table_name]['columns']
 
-        for column in sqlglot.get_columns(expr):
+        for column in expr.find_all(exp.Column):
             
-            if column not in catalog_columns:
-                #raise ValueError(f"Column {column} does not exist in table {table_name}.")
-                raise ValueError(gettext("Column {} does not exist in table {}").format(column, table_name))
-
+            column_name = column.name  
+            if column_name not in catalog_columns:
+                raise ValueError(gettext("Column {} does not exist in table {}").format(column_name, table_name))
+            
 #validações de usuarios, permições
