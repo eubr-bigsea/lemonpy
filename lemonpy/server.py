@@ -35,6 +35,8 @@ from lemonpy.custom_types import (
 )
 from lemonpy.parser_cmd import get_all, get_ast, optimize
 
+from subqueries import replace_locations
+
 logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
@@ -598,6 +600,7 @@ class AsyncPsqlHandler:
                     db=sqlglot.expressions.Identifier(this=self.current_schema),
                 )
                 tables = get_all(new_expr, exp.Table)
+                replace_locations(new_expr)
                 print("=" * 10)
                 print(new_expr.sql())
                 print(tables)
@@ -697,7 +700,7 @@ class AsyncPsqlHandler:
         password = (
             (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
         ).decode()
-        current_password = b"sp33d"  # Senha em bytes
+        current_password = "sp33d"  # Senha em bytes
         username = b"postgres"  # Nome do usuário em bytes
 
         if self.args.auth == "md5":
