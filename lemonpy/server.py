@@ -42,6 +42,8 @@ from validation import (
     validate_columns_in_catalog
 )
 
+from subqueries import (replace_tables, load_config)
+
 logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
@@ -609,7 +611,10 @@ class AsyncPsqlHandler:
                     db=sqlglot.expressions.Identifier(this=self.current_schema),
                 )
                 tables = get_all(new_expr, exp.Table)
+
+
                 # Query validations
+                
                 try:
                     validate_same_database(tables, self.current_database)
                 except ValueError as e:
@@ -626,6 +631,10 @@ class AsyncPsqlHandler:
                 except ValueError as e:
                     await self.send_error(severity="FATAL", code="28P01", message=str(e))
                     return
+                
+                # Subqueries
+                #replace_tables(new_expr, catalog, self.current_database, self.current_schema)
+                replace_tables(new_expr, catalog, self.current_database, self.current_schema, self.session_parameters['roles'])
                 
                 print("=" * 10)
                 print(new_expr.sql())
@@ -718,6 +727,7 @@ class AsyncPsqlHandler:
         # Test if client supports binary encoding of cols value
         self.binary_transfer = b"binary" in msg
 
+    '''
     async def read_authentication(self):
         type_code = await self.pgbuf.read_byte()
 
@@ -731,7 +741,7 @@ class AsyncPsqlHandler:
         password = (
             (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
         )
-
+        #modificar autenticação, salvar permições e grupos
         current_password = b"sp33d"  # Senha em bytes
         username = b"postgres"  # Nome do usuário em bytes
 
@@ -750,6 +760,30 @@ class AsyncPsqlHandler:
         if password != current_password:
             return False
         return True
+    '''
+    async def read_authentication(self):
+        type_code = await self.pgbuf.read_byte()
+
+        if type_code != b"p":
+            await self.send_error("FATAL", "28000", "Authentication failure")
+            raise Exception(f"Only 'Password' auth is supported, got {type_code!r}")
+
+        msglen = await self.pgbuf.read_int32()
+        password = (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
+    
+        username = self.user.encode()
+        user_config = self.config.get('users', {}).get(self.user, {})
+
+        if not user_config or password != user_config.get('password', '').encode():
+            return False
+
+        # Save roles in the session
+        self.session_parameters['roles'] = user_config.get('roles', [])
+        return True
+
+    def has_role(self, role: str) -> bool:
+        return role in self.session_parameters.get('roles', [])
+
 
     async def send_ssl_response(self):
         """Send SSL Response.
@@ -977,11 +1011,20 @@ async def handle_client(
     args: argparse.Namespace,
     certificates: List[Path],
 ) -> None:
+    '''
     with open(args.config) as f:
         config = Config.from_dict(yaml.load(f, Loader=yaml.Loader))
     catalog_type: str = config.catalog.type
     if catalog_type == "file":
         catalog = FileCatalog(config.catalog.path).build()
+    else:
+        catalog = None
+    '''
+    with open(args.config) as f:
+        config = load_config(args.config)
+    catalog_type: str = config['catalog']['type']
+    if catalog_type == "file":
+        catalog = FileCatalog(config['catalog']['path']).build()
     else:
         catalog = None
 
