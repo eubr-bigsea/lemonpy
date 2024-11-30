@@ -2,10 +2,16 @@ from sqlglot import parse_one, exp
 import yaml
 from typing import Dict
 
-def load_config(config_path: str = "config.yaml") -> Dict:
+import yaml
+
+def load_config(config_path: str = "config.yaml") -> dict:
     with open(config_path, 'r') as file:
         return yaml.safe_load(file)
-    
+'''
+def load_config(config_path: str = "config.yaml") -> Dict:
+    with open(config_path, 'r') as file:
+      return yaml.safe_load(file)
+'''  
 def transform_columns(expr: exp.Expression, catalog: dict, current_db: str, current_schema: str, roles: list[str]):
    
     for table in expr.find_all(exp.Table):

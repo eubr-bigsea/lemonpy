@@ -94,7 +94,9 @@ class AsyncPsqlHandler:
     )
 
     def __init__(self, reader, writer, args, config, certificates, catalog):
-        self.config = config
+        #self.config = config
+        self.config = load_config("config.yaml")
+
         self.args = args
 
         self.reader = reader
@@ -614,7 +616,7 @@ class AsyncPsqlHandler:
 
 
                 # Query validations
-                
+                '''
                 try:
                     validate_same_database(tables, self.current_database)
                 except ValueError as e:
@@ -631,7 +633,7 @@ class AsyncPsqlHandler:
                 except ValueError as e:
                     await self.send_error(severity="FATAL", code="28P01", message=str(e))
                     return
-                
+                '''
                 # Subqueries
                 #replace_tables(new_expr, catalog, self.current_database, self.current_schema)
                 replace_tables(new_expr, catalog, self.current_database, self.current_schema, self.session_parameters['roles'])
@@ -920,15 +922,27 @@ class AsyncPsqlHandler:
         if True:
             import decimal
 
-            pg_conf: Source = self.config.get_source("pg_test")
+            #pg_conf: Source = self.config.get_source("pg_test")
+            pg_conf = self.config.get('sources', {}).get('pg_test', {})
+            if not pg_conf:
+                raise ValueError("Source configuration for 'pg_test' not found.")
+
+
+
 
             conn = await asyncpg.connect(
-                user=pg_conf.user,
-                password=pg_conf.password,
-                database=pg_conf.database,
-                host=pg_conf.host,
-                port=pg_conf.port,
+                user = pg_conf.get('user'),
+                password = pg_conf.get('password'),
+                host = pg_conf.get('host'),
+                port = pg_conf.get('port'),
+                database = pg_conf.get('database'),
+                #user=pg_conf.user,
+                #password=pg_conf.password,
+                #database=pg_conf.database,
+                #host=pg_conf.host,
+                #port=pg_conf.port,
             )
+            
             for float_type in ["float4", "float8"]:
                 await conn.set_type_codec(
                     float_type,
