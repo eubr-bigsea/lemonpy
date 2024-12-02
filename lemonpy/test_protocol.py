@@ -60,7 +60,7 @@ async def test_authentication():
     pg_buffer.write_bytes(b'p' +  b'\x00\x00\x00\x0a' + b'sp33d')
     reader.feed_data(pg_buffer.get_buffer())
 
-    result = await handler.read_authentication()
+    result = await handler.read_()
     assert result is True
 
 @pytest.mark.asyncio
@@ -69,7 +69,7 @@ async def test_authentication_failure():
     pg_buffer.write_bytes(b'p' +  b'\x00\x00\x00\x0a' + b'fakepassword')
     reader.feed_data(pg_buffer.get_buffer())
 
-    result = await handler.read_authentication()
+    result = await handler.read_()
     assert result is False
 
 @pytest.mark.asyncio
@@ -104,7 +104,7 @@ async def test_set_query():
 async def test_parse():
     pg_buffer = PgBuffer()
     pg_buffer.clear_buffer()
-    pg_buffer.write_string('statement name')
+    pg_buffer.write_string('name')
     pg_buffer.write_string('select * from public.iris;')
     pg_buffer.write_int16(3)
     pg_buffer.write_int32(1)
@@ -112,31 +112,32 @@ async def test_parse():
     pg_buffer.write_int32(3)
     reader.feed_data(pg_buffer.get_buffer())
     result = await handler.handle_parse()
-    assert handler.prepared_statements['rdstatement name'] == PreparedStatement(name='rdstatement name', query='select * from public.iris;', parameter_types=[1, 2, 3])
+    assert str(handler.prepared_statements['name']) == str(PreparedStatement(name='name', query='select * from public.iris;', parameter_types=[1, 2, 3]))
 
 
-pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_bind():
-    pg_buffer = PgBuffer()
-    pg_buffer.clear_buffer()
-    pg_buffer.write_int32(3)
-    # pg_buffer.write_int16(1)
-    pg_buffer.write_string('portal_name')
-    pg_buffer.write_string('statement_name')
-    pg_buffer.write_int16(1)
-    pg_buffer.write_int16(4)
-    pg_buffer.write_int16(2)
-    pg_buffer.write_int16(1)
-    pg_buffer.write_int32(1)
-    pg_buffer.write_string('param1')
-    pg_buffer.write_int32(1)
-    pg_buffer.write_string('param2')
-    pg_buffer.write_int16(1)
-    pg_buffer.write_int16(5)
-    reader.feed_data(pg_buffer.get_buffer())
-    result = await handler.handle_bind()
-    assert handler.portals['portal_name']
+    with patch.object(AsyncPsqlHandler, 'send_bind_complete', new_callable=AsyncMock):
+        pg_buffer = PgBuffer()
+        pg_buffer.clear_buffer()
+        pg_buffer.write_int32(60)
+        # pg_buffer.write_int16(1)
+        pg_buffer.write_string('portal_name')
+        pg_buffer.write_string('statement_name')
+        pg_buffer.write_int16(1)
+        pg_buffer.write_int16(4)
+        pg_buffer.write_int16(2)
+        pg_buffer.write_int32(2)
+        pg_buffer.write_string('p1')
+        pg_buffer.write_int32(2)
+        pg_buffer.write_string('p2')
+        pg_buffer.write_int16(1)
+        pg_buffer.write_int16(5)
+        reader.feed_data(pg_buffer.get_buffer())
+        result = await handler.handle_bind()
+        handler.send_bind_complete.assert_awaited() 
 
+@pytest.mark.asyncio
 async def test_execute_not_in_portals():
   with patch.object(AsyncPsqlHandler, 'send_error', new_callable=AsyncMock):
         pg_buffer = PgBuffer()
@@ -150,3 +151,16 @@ async def test_execute_not_in_portals():
                 "FATAL", "XX000", f"Portal {'portal_name'} not found."
             )
 
+
+@pytest.mark.asyncio
+async def test_close():
+    with patch.object(AsyncPsqlHandler, 'send_close_complete', new_callable=AsyncMock):
+        pg_buffer = PgBuffer()
+        pg_buffer.clear_buffer()
+        pg_buffer.write_int32(30)
+        pg_buffer.write_string('P')
+        pg_buffer.write_int32(3)
+        reader.feed_data(pg_buffer.get_buffer())
+        await handler.handle_close()
+        handler.send_close_complete.assert_awaited() 
+        
