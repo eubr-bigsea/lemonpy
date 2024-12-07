@@ -636,7 +636,11 @@ class AsyncPsqlHandler:
                 '''
                 # Subqueries
                 #replace_tables(new_expr, catalog, self.current_database, self.current_schema)
-                replace_tables(new_expr, catalog, self.current_database, self.current_schema, self.session_parameters['roles'])
+                try:
+                    replace_tables(new_expr, catalog, self.current_database, self.current_schema, self.session_parameters['roles'])
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
                 
                 print("=" * 10)
                 print(new_expr.sql())
@@ -779,7 +783,6 @@ class AsyncPsqlHandler:
         if not user_config or password != user_config.get('password', '').encode():
             return False
 
-        # Save roles in the session
         self.session_parameters['roles'] = user_config.get('roles', [])
         return True
 
