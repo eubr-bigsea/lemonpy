@@ -597,6 +597,8 @@ class AsyncPsqlHandler:
                 ),
             )
             return
+        catalog_path = "catalog.yaml" 
+        catalog = load_config(catalog_path)
         for expr in expr_list:
             if isinstance(expr, exp.Select):
 
