@@ -120,12 +120,10 @@ def transform_table(table: exp.Table, catalog: dict, current_db: str, current_sc
     schema = table.db or current_schema  
     table_name = table.name
 
-    # Verifica se o banco de dados existe no catálogo
     databases = catalog['catalogs']['default']['databases']
     if db not in databases:
         raise ValueError(f"Database '{db}' not found in catalog. Please connect to a valid database.")
     
-    # Verifica se o esquema existe no banco de dados
     schemas = databases[db]['schemas']
     if not schemas:
         raise ValueError(f"No schemas found in database '{db}'.")
@@ -140,29 +138,29 @@ def transform_table(table: exp.Table, catalog: dict, current_db: str, current_sc
     if not table_data:
         raise ValueError(f"Table '{table_name}' not found in any schema of database '{db}'.")
 
+    #logs de depuração
+    print(f"Informações da tabela: {table_data}")
+    print(f"Roles do usuário: {roles}")
 
     available_roles = table_data.get('roles', {})
-    print(f"Roles disponíveis no catálogo: {list(available_roles.keys())}")
-
-    invalid_roles = [role for role in roles if role not in available_roles]
-    if invalid_roles:
-        raise ValueError(f"Invalid roles detected: {invalid_roles}. Please check the user's permissions.")
-
-
     for role in roles:
+        if role not in available_roles:
+            print(f"Aviso: Role '{role}' não encontrado no catálogo para a tabela '{table_name}'.")
+
+    #logs de depuração
+    for role in roles:
+        print(f"Processando role: {role}")
         role_action = available_roles.get(role)
+        print(f"Ação encontrada para o role '{role}': {role_action}")
     
         if not role_action:
             continue  
-
         action = role_action.get('action')
         value = role_action.get('value')
         print(f"Ação: {action}, Valor: {value}")
 
         if action == "DENY":
-            
-            print(f"Access denied to table '{table_name}' for role '{role}'.")
-
+            print(f"Acesso negado à tabela '{table_name}' para o role '{role}'.")
             raise ValueError(f"Access to table '{table_name}' is denied for role '{role}'.")
         
         elif action == "WHERE":
@@ -180,7 +178,7 @@ def transform_table(table: exp.Table, catalog: dict, current_db: str, current_sc
             if "view" in table_data:
                 return parse_one(f"({table_data['view']}) AS {table.alias_or_name}")
 
-    print(f"No applicable rule found for roles {roles}. Applying default logic.")
+    print(f"Nenhuma regra aplicável encontrada para os roles {roles}. Aplicando lógica padrão.")
 
     if "filter" in table_data:
         filter_condition = table_data["filter"]
@@ -196,7 +194,98 @@ def transform_table(table: exp.Table, catalog: dict, current_db: str, current_sc
     return exp.Table(this=f"{db}.{schema}.{table_name}", alias=table.alias)
 
 
+'''
+def transform_table(table: exp.Table, catalog: dict, current_db: str, current_schema: str) -> exp.Expression:
+    db = table.catalog or current_db
+    schema = table.db or current_schema  
+    table_name = table.name
 
+    databases = catalog['catalogs']['default']['databases']
+    
+    if db not in databases:
+        raise ValueError(f"Database '{db}' not found in catalog. Please connect to a valid database.")
+    
+    schemas = databases[db]['schemas']
+
+    if not schemas:
+        raise ValueError(f"No schemas found in database '{db}'.")
+
+    table_data = None
+    for schema_name, schema_data in schemas.items():
+        if table_name in schema_data['tables']:
+            table_data = schema_data['tables'][table_name]
+            schema = schema_name  
+            break
+
+    if not table_data:
+        raise ValueError(f"Table '{table_name}' not found in any schema of database '{db}'.")
+
+    if "filter" in table_data:
+        filter_condition = table_data["filter"]
+        return parse_one(f"(SELECT * FROM {db}.{schema}.{table_name} WHERE {filter_condition}) AS {table.alias_or_name}")
+
+    
+    if "view" in table_data:
+        return parse_one(f"({table_data['view']}) AS {table.alias_or_name}")
+
+    if "table" in table_data:
+        renamed_table = table_data["table"]
+        return exp.Table(this=renamed_table, alias=table.alias)
+
+    return table
+'''
+'''
+def transform_table(table: exp.Table, catalog: dict, current_db: str, current_schema: str) -> exp.Expression:
+
+    db = table.catalog or current_db
+    schema = table.db or current_schema  
+    table_name = table.name
+
+    databases = catalog['catalogs']['default']['databases']
+    
+    if db not in databases:
+        raise ValueError(f"Database '{db}' not found in catalog. Please connect to a valid database.")
+    
+    schemas = databases[db]['schemas']
+
+    if not schemas:
+        raise ValueError(f"No schemas found in database '{db}'.")
+    
+    table_found = False
+    for schema_name, schema_data in schemas.items():
+        if table_name in schema_data['tables']:
+            table_found = True
+            table_data = schema_data['tables'][table_name]
+            schema = schema_name  
+            break
+    print("logs")
+    print(table_data)
+    if not table_found:
+        raise ValueError(f"Table '{table_name}' not found in any schema of database '{db}'.")
+
+    if "view" in table_data:
+        return parse_one(f"({table_data['view']}) AS {table.alias_or_name}")
+
+    if "table" in table_data:
+        renamed_table = table_data["table"]
+        return exp.Table(this=renamed_table, alias=table.alias)
+
+    if "filter" in table_data:
+        print("teste")
+
+
+    return table
+'''
+'''
+def replace_tables(expr: exp.Expression, catalog: dict, current_db: str, current_schema: str, roles: list[str]):
+    
+    for table in expr.find_all(exp.Table):
+        transformed_table = transform_table(table, catalog, current_db, current_schema)
+        if transformed_table != table:
+            table.replace(transformed_table)
+            break
+    transform_columns(expr, catalog, current_db, current_schema, roles)
+'''
 def replace_tables(expr: exp.Expression, catalog: dict, current_db: str, current_schema: str, roles: list[str]):
     for table in expr.find_all(exp.Table):
         transformed_table = transform_table(table, catalog, current_db, current_schema, roles)
