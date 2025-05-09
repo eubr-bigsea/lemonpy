@@ -35,6 +35,15 @@ from lemonpy.custom_types import (
 )
 from lemonpy.parser_cmd import get_all, get_ast, optimize
 
+from validation import (
+    load_catalog,
+    validate_same_database,
+    validate_table_in_catalog,
+    validate_columns_in_catalog
+)
+
+from subqueries import (replace_tables, load_config)
+
 logging.basicConfig(format="%(levelname)s: %(name)s: %(message)s")
 
 log = logging.getLogger(__name__)
@@ -85,7 +94,9 @@ class AsyncPsqlHandler:
     )
 
     def __init__(self, reader, writer, args, config, certificates, catalog):
-        self.config = config
+        #self.config = config
+        self.config = load_config("config.yaml")
+
         self.args = args
 
         self.reader = reader
@@ -562,6 +573,9 @@ class AsyncPsqlHandler:
         await self._handle_query(sql)
 
     async def _handle_query(self, sql, params=None):
+         
+        catalog = load_catalog("../catalog.yaml")
+
         if params is None:
             params = []
 
@@ -583,11 +597,14 @@ class AsyncPsqlHandler:
                 ),
             )
             return
+        catalog_path = "catalog.yaml" 
+        catalog = load_config(catalog_path)
         for expr in expr_list:
             if isinstance(expr, exp.Select):
-                # Improving select
 
+                # Improving select
                 # Notice: in sqlglot, catalog = database and db = schema
+                #usar o new_expr
                 new_expr = optimize(
                     expr,
                     dialect="postgres",
@@ -598,9 +615,43 @@ class AsyncPsqlHandler:
                     db=sqlglot.expressions.Identifier(this=self.current_schema),
                 )
                 tables = get_all(new_expr, exp.Table)
+
+
+                # Query validations
+                '''
+                try:
+                    validate_same_database(tables, self.current_database)
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                try:
+                    validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                
+                try:
+                    validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                '''
+                # Subqueries
+                #replace_tables(new_expr, catalog, self.current_database, self.current_schema)
+                try:
+                    replace_tables(new_expr, catalog, self.current_database, self.current_schema, self.session_parameters['roles'])
+                except ValueError as e:
+                    await self.send_error(severity="FATAL", code="28P01", message=str(e))
+                    return
+                
                 print("=" * 10)
                 print(new_expr.sql())
                 print(tables)
+
+                #validate_same_database(tables, self.current_database)
+                #validate_table_in_catalog(tables, catalog, self.current_database, self.current_schema)
+                #validate_columns_in_catalog(expr, catalog, self.current_database, self.current_schema)
+
                 # Here, db is schema and catalog is database
                 for table in tables:
                     # Validate table db, schema and name (they are in catalog)
@@ -684,6 +735,7 @@ class AsyncPsqlHandler:
         # Test if client supports binary encoding of cols value
         self.binary_transfer = b"binary" in msg
 
+    '''
     async def read_authentication(self):
         type_code = await self.pgbuf.read_byte()
 
@@ -696,7 +748,8 @@ class AsyncPsqlHandler:
         msglen = await self.pgbuf.read_int32()
         password = (
             (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
-        ).decode()
+        )
+        #modificar autenticação, salvar permições e grupos
         current_password = b"sp33d"  # Senha em bytes
         username = b"postgres"  # Nome do usuário em bytes
 
@@ -715,6 +768,29 @@ class AsyncPsqlHandler:
         if password != current_password:
             return False
         return True
+    '''
+    async def read_authentication(self):
+        type_code = await self.pgbuf.read_byte()
+
+        if type_code != b"p":
+            await self.send_error("FATAL", "28000", "Authentication failure")
+            raise Exception(f"Only 'Password' auth is supported, got {type_code!r}")
+
+        msglen = await self.pgbuf.read_int32()
+        password = (await self.pgbuf.read_bytes(msglen - 4)).strip(b"\0")
+    
+        username = self.user.encode()
+        user_config = self.config.get('users', {}).get(self.user, {})
+
+        if not user_config or password != user_config.get('password', '').encode():
+            return False
+
+        self.session_parameters['roles'] = user_config.get('roles', [])
+        return True
+
+    def has_role(self, role: str) -> bool:
+        return role in self.session_parameters.get('roles', [])
+
 
     async def send_ssl_response(self):
         """Send SSL Response.
@@ -851,15 +927,27 @@ class AsyncPsqlHandler:
         if True:
             import decimal
 
-            pg_conf: Source = self.config.get_source("pg_test")
+            #pg_conf: Source = self.config.get_source("pg_test")
+            pg_conf = self.config.get('sources', {}).get('pg_test', {})
+            if not pg_conf:
+                raise ValueError("Source configuration for 'pg_test' not found.")
+
+
+
 
             conn = await asyncpg.connect(
-                user=pg_conf.user,
-                password=pg_conf.password,
-                database=pg_conf.database,
-                host=pg_conf.host,
-                port=pg_conf.port,
+                user = pg_conf.get('user'),
+                password = pg_conf.get('password'),
+                host = pg_conf.get('host'),
+                port = pg_conf.get('port'),
+                database = pg_conf.get('database'),
+                #user=pg_conf.user,
+                #password=pg_conf.password,
+                #database=pg_conf.database,
+                #host=pg_conf.host,
+                #port=pg_conf.port,
             )
+            
             for float_type in ["float4", "float8"]:
                 await conn.set_type_codec(
                     float_type,
@@ -942,11 +1030,20 @@ async def handle_client(
     args: argparse.Namespace,
     certificates: List[Path],
 ) -> None:
+    '''
     with open(args.config) as f:
         config = Config.from_dict(yaml.load(f, Loader=yaml.Loader))
     catalog_type: str = config.catalog.type
     if catalog_type == "file":
         catalog = FileCatalog(config.catalog.path).build()
+    else:
+        catalog = None
+    '''
+    with open(args.config) as f:
+        config = load_config(args.config)
+    catalog_type: str = config['catalog']['type']
+    if catalog_type == "file":
+        catalog = FileCatalog(config['catalog']['path']).build()
     else:
         catalog = None
 
